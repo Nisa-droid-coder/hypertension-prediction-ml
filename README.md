@@ -12,7 +12,7 @@ Explore data visually
 Train ML models (Logistic Regression, Random Forest, XGBoost)
 Perform personalized risk assessment
 
-⚙️ Tech Stack
+⚙️ Tech Stack:
 Python
 Streamlit
 Scikit-learn
@@ -20,14 +20,14 @@ XGBoost
 Pandas, NumPy
 Plotly / Matplotlib
 
-📊 Features
+📊 Features:
 Data validation & preprocessing
-Exploratory Data Analysis (EDA)
-Model training & comparison
-Feature importance analysis
+Exploratory Data Analysis (EDA),
+Model training & comparison,
+Feature importance analysis,
 Personalized risk prediction
 
-🧠 Machine Learning Models
-Logistic Regression
-Random Forest
+🧠 Machine Learning Models:
+Logistic Regression,
+Random Forest,
 XGBoost

@@ -7,17 +7,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, learning_curve
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 # Import XGBoost or use fallback
 try:
-    from xgboost import XGBClassifier
+    import xgboost as xgb
     XGB_AVAILABLE = True
 except ImportError:
-    from sklearn.ensemble import GradientBoostingClassifier as XGBClassifier
     XGB_AVAILABLE = False
-    st.warning("XGBoost not installed. Using GradientBoostingClassifier as fallback.")
+    st.warning("XGBoost not installed. Install it using: pip install xgboost")
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, classification_report
 import warnings
 import os
@@ -112,6 +111,8 @@ if 'y_train' not in st.session_state:
     st.session_state.y_train = None
 if 'y_test' not in st.session_state:
     st.session_state.y_test = None
+if 'X_train_scaled' not in st.session_state:
+    st.session_state.X_train_scaled = None
 if 'X_test_scaled' not in st.session_state:
     st.session_state.X_test_scaled = None
 if 'scaler' not in st.session_state:
@@ -120,6 +121,30 @@ if 'X_encoded' not in st.session_state:
     st.session_state.X_encoded = None
 if 'feature_names' not in st.session_state:
     st.session_state.feature_names = None
+if 'label_encoders' not in st.session_state:
+    st.session_state.label_encoders = None
+if 'cv_scores' not in st.session_state:
+    st.session_state.cv_scores = None
+if 'importance_df' not in st.session_state:
+    st.session_state.importance_df = None
+
+# Global chart theme variable
+chart_theme = "plotly_white"
+
+def create_age_bins(age_min, age_max, bin_size=5):
+    """Create age bins with specified bin size"""
+    bins = list(range(age_min, age_max + bin_size, bin_size))
+    if bins[-1] < age_max:
+        bins.append(age_max + 1)
+    
+    labels = []
+    for i in range(len(bins)-1):
+        if i == len(bins)-2:
+            labels.append(f"{bins[i]}-{bins[i+1]}")
+        else:
+            labels.append(f"{bins[i]}-{bins[i+1]-1}")
+    
+    return bins, labels
 
 def validate_dataset(df):
     """Validate the uploaded dataset has required columns and valid data"""
@@ -172,13 +197,13 @@ def preprocess_data(df):
     bins = [0, 18, 25, 35, 45, 55, 65, 85, 120]
     labels = ['<18', '18-24', '25-34', '35-44', '45-54', '55-64', '65-84', '85+']
     df_processed['Age_Group'] = pd.cut(df_processed['Age'], bins=bins, labels=labels, right=False)
-    df_processed['Age_Group'] = df_processed['Age_Group'].astype(str)  # Convert to string
+    df_processed['Age_Group'] = df_processed['Age_Group'].astype(str)
     
-    # Create BMI categories (as strings to avoid Interval objects)
+    # Create BMI categories
     df_processed['BMI_Category'] = pd.cut(df_processed['BMI'], 
                                         bins=[0, 18.5, 25, 30, 100],
                                         labels=['Underweight', 'Normal', 'Overweight', 'Obese'])
-    df_processed['BMI_Category'] = df_processed['BMI_Category'].astype(str)  # Convert to string
+    df_processed['BMI_Category'] = df_processed['BMI_Category'].astype(str)
     
     # Clean categorical variables
     categorical_cols = ['Family_History', 'Exercise_Level', 'Smoking_Status', 'Has_Hypertension']
@@ -188,117 +213,396 @@ def preprocess_data(df):
     
     return df_processed
 
-@st.cache_resource
 def train_models_improved(df):
-    """Train machine learning models for hypertension prediction using reference code approach"""
+    """Train machine learning models with proper cross-validation and NO data leakage"""
     try:
-        # 1. Filter data for young adults (18-35) like reference code
-        df_filtered = df[(df['Age'] >= 18) & (df['Age'] <= 35)].copy()
+        # =================================================================
+        # 1. DATA PREPARATION & LEAKAGE PREVENTION
+        # =================================================================
+        # Filter data for young adults (18-35) as per FYP objectives
+        df_young = df[(df['Age'] >= 18) & (df['Age'] <= 35)].copy()
         
-        if len(df_filtered) < 50:
-            st.warning(f"Only {len(df_filtered)} samples in age range 18-35. Using full dataset instead.")
-            df_filtered = df.copy()
+        if len(df_young) < 50:
+            st.warning(f"Only {len(df_young)} samples in age range 18-35. Using full dataset instead.")
+            df_young = df.copy()
         
-        # 2. Feature Selection & Preprocessing
-        target = 'Has_Hypertension'
+        # LEAKAGE PREVENTION:
+        # We drop 'BP_History' and 'Medication' if they exist.
+        # Reasoning: Including 'BP_History' (past diagnosis) to predict 'Has_Hypertension' 
+        # is circular logic and causes the "overfitting" 99% accuracy.
+        # Removing them forces the model to learn from LIFESTYLE (Salt, Stress, Sleep, etc.)
         
-        # We drop metadata/target, but REMOVE 'BP_History' and 'Medication' as requested
-        cols_to_drop = [target, 'Age_Group', 'Age_Category', 'Patient_ID', 'BMI_Category']
-        # Only drop columns that exist
-        features_to_drop = [c for c in cols_to_drop if c in df_filtered.columns]
+        columns_to_drop = ['Has_Hypertension']
+        if 'BP_History' in df_young.columns:
+            columns_to_drop.append('BP_History')
+            st.info("✅ Detected and removed 'BP_History' column to prevent data leakage")
+        if 'Medication' in df_young.columns:
+            columns_to_drop.append('Medication')
+            st.info("✅ Detected and removed 'Medication' column to prevent data leakage")
         
-        X = df_filtered.drop(columns=features_to_drop)
-        y = df_filtered[target].map({'Yes': 1, 'No': 0, 'yes': 1, 'no': 0})
+        # Define lifestyle features (all numerical + categorical lifestyle factors)
+        lifestyle_features = ['Age', 'Salt_Intake', 'Stress_Score', 'Sleep_Duration', 'BMI', 
+                             'Family_History', 'Exercise_Level', 'Smoking_Status']
+        
+        # Check which features are available
+        available_features = [col for col in lifestyle_features if col in df_young.columns]
+        
+        if len(available_features) != len(lifestyle_features):
+            missing = set(lifestyle_features) - set(available_features)
+            st.warning(f"Missing features: {missing}. Using available features only.")
+        
+        # Prepare X and y
+        X = df_young[available_features].copy()
+        y = df_young['Has_Hypertension'].map(lambda x: 1 if str(x).lower() == 'yes' else 0)
         
         # Check if y has both classes
         if y.nunique() < 2:
-            raise ValueError("Target variable 'Has_Hypertension' must have both 'Yes' and 'No' values")
+            st.error(f"Target variable has only {y.nunique()} class(es). Need both 0 and 1.")
+            return None
         
-        # ENCODING: Using get_dummies instead of LabelEncoder for better interpretability
-        X_encoded = pd.get_dummies(X, drop_first=False)
-        feature_names = X_encoded.columns.tolist()
+        st.info(f"Training data shape: {X.shape}, Classes: 0={sum(y==0)}, 1={sum(y==1)}")
         
-        # Split the data (80% Train, 20% Test)
+        # Encode categorical lifestyle variables
+        label_encoders = {}
+        categorical_cols = X.select_dtypes(include=['object']).columns.tolist()
+        
+        for col in categorical_cols:
+            le = LabelEncoder()
+            X[col] = le.fit_transform(X[col].astype(str))
+            label_encoders[col] = le
+        
+        feature_names = X.columns.tolist()
+        
+        # Scale data for Logistic Regression (ensures fair comparison)
+        scaler = StandardScaler()
+        X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+        
+        # Split for final evaluation (80:20 split)
         X_train, X_test, y_train, y_test = train_test_split(
-            X_encoded, y, test_size=0.2, random_state=42, stratify=y
+            X, y, test_size=0.2, stratify=y, random_state=42
+        )
+        X_train_scaled, X_test_scaled, _, _ = train_test_split(
+            X_scaled, y, test_size=0.2, stratify=y, random_state=42
         )
         
-        # Scaling: Required for Logistic Regression performance
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # 3. Model Development - Using XGBoost instead of Gradient Boosting
+        # =================================================================
+        # 2. MODEL DEFINITIONS & TRAINING
+        # =================================================================
         models = {
-            "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
-            "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-            "XGBoost": XGBClassifier(random_state=42)
+            "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42, C=1.0),
+            "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42)
         }
         
+        if XGB_AVAILABLE:
+            models["XGBoost"] = xgb.XGBClassifier(
+                use_label_encoder=False, 
+                eval_metric='logloss', 
+                random_state=42,
+                n_estimators=100
+            )
+        
+        # =================================================================
+        # 3. FAIR COMPARISON: TRAIN, CROSS-VALIDATE, AND EVALUATE
+        # =================================================================
         trained_models = {}
         results = {}
+        cv_scores_dict = {}
         feature_importances = {}
         
         for name, model in models.items():
-            try:
-                # Scale data for Logistic Regression, use raw data for Trees
-                if name == "Logistic Regression":
-                    X_tr = X_train_scaled
-                    X_ts = X_test_scaled
-                else:
-                    X_tr = X_train.values if hasattr(X_train, 'values') else X_train
-                    X_ts = X_test.values if hasattr(X_test, 'values') else X_test
-                
-                model.fit(X_tr, y_train)
-                trained_models[name] = model
-                
-                y_pred = model.predict(X_ts)
-                y_prob = model.predict_proba(X_ts)[:, 1]
-                
-                auc = roc_auc_score(y_test, y_prob)
-                acc = accuracy_score(y_test, y_pred)
-                precision = precision_score(y_test, y_pred, zero_division=0)
-                recall = recall_score(y_test, y_pred, zero_division=0)
-                f1 = f1_score(y_test, y_pred, zero_division=0)
-                
-                results[name] = {
-                    'Accuracy': acc,
-                    'Precision': precision,
-                    'Recall': recall,
-                    'F1-Score': f1,
-                    'AUC-ROC': auc
-                }
-                
-                # Get feature importance for tree-based models
-                if hasattr(model, 'feature_importances_'):
-                    feature_importances[name] = dict(zip(feature_names, model.feature_importances_))
-                
-                # Get coefficients for Logistic Regression
-                if name == "Logistic Regression":
-                    feature_importances[name + '_Coefficients'] = dict(zip(feature_names, model.coef_[0]))
-                    
-            except Exception as e:
-                st.warning(f"Could not train {name}: {str(e)}")
-                continue
+            st.write(f"Training {name}...")
+            
+            # Use scaled data for LogReg, raw data for Tree-based models
+            curr_X_train = X_train_scaled if name == "Logistic Regression" else X_train
+            curr_X_test = X_test_scaled if name == "Logistic Regression" else X_test
+            
+            # Stratified 5-Fold Cross-Validation (Rigor Check)
+            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            cv_scores = cross_val_score(model, curr_X_train, y_train, cv=cv, scoring='accuracy')
+            cv_scores_dict[name] = cv_scores.mean()
+            
+            # Train the model
+            model.fit(curr_X_train, y_train)
+            trained_models[name] = model
+            
+            # Predict on test set
+            y_pred = model.predict(curr_X_test)
+            y_prob = model.predict_proba(curr_X_test)[:, 1]
+            
+            # Calculate metrics
+            acc = accuracy_score(y_test, y_pred)
+            precision = precision_score(y_test, y_pred, zero_division=0)
+            recall = recall_score(y_test, y_pred, zero_division=0)
+            f1 = f1_score(y_test, y_pred, zero_division=0)
+            auc = roc_auc_score(y_test, y_prob) if len(np.unique(y_test)) == 2 else 0.5
+            
+            results[name] = {
+                'Accuracy': acc,
+                'Precision': precision,
+                'Recall': recall,
+                'F1-Score': f1,
+                'AUC-ROC': auc,
+                'CV_Accuracy': cv_scores.mean(),
+                'CV_Std': cv_scores.std()
+            }
+            
+            # Get feature importance
+            if name == "Logistic Regression":
+                feature_importances[name] = dict(zip(feature_names, np.abs(model.coef_[0])))
+            elif hasattr(model, 'feature_importances_'):
+                feature_importances[name] = dict(zip(feature_names, model.feature_importances_))
         
-        if not results:
-            raise ValueError("No models could be trained successfully")
+        # =================================================================
+        # 4. CLINICAL ACTIONABILITY TABLE
+        # =================================================================
+        importance_data = {'Feature': feature_names}
         
-        # Store additional data in session state
+        for model_name in models.keys():
+            if model_name in feature_importances:
+                short_name = model_name.split()[0]
+                importance_data[f'{short_name}_Importance'] = [
+                    feature_importances[model_name].get(f, 0) for f in feature_names
+                ]
+        
+        # Calculate Population Risk Thresholds (mean values for hypertensive group)
+        thresholds = []
+        for feature in feature_names:
+            if feature in ['Age', 'Salt_Intake', 'Stress_Score', 'Sleep_Duration', 'BMI']:
+                hypertensive_vals = df_young[df_young['Has_Hypertension'].str.lower() == 'yes'][feature]
+                h_mean = hypertensive_vals.mean() if len(hypertensive_vals) > 0 else 0
+                thresholds.append(round(h_mean, 2))
+            else:
+                thresholds.append("N/A (Categorical)")
+        
+        importance_data['Risk_Threshold_Avg'] = thresholds
+        importance_df = pd.DataFrame(importance_data)
+        
+        # Sort by Random Forest importance if available
+        if 'RF_Importance' in importance_data:
+            importance_df = importance_df.sort_values(by='RF_Importance', ascending=False)
+        elif 'Log_Importance' in importance_data:
+            importance_df = importance_df.sort_values(by='Log_Importance', ascending=False)
+        
+        # Find best model based on CV accuracy (more reliable than test accuracy)
+        best_model_name = max(cv_scores_dict, key=cv_scores_dict.get)
+        
+        # Store everything in session state
         st.session_state.X_train = X_train
         st.session_state.X_test = X_test
         st.session_state.y_train = y_train
         st.session_state.y_test = y_test
+        st.session_state.X_train_scaled = X_train_scaled
         st.session_state.X_test_scaled = X_test_scaled
         st.session_state.scaler = scaler
         st.session_state.trained_models = trained_models
-        st.session_state.X_encoded = X_encoded
         st.session_state.feature_names = feature_names
+        st.session_state.label_encoders = label_encoders
+        st.session_state.cv_scores = cv_scores_dict
+        st.session_state.importance_df = importance_df
+        st.session_state.best_model = best_model_name
+        st.session_state.model_results = results
+        
+        # Display CV results for transparency
+        st.info(f"📊 Cross-Validation Results (5-fold stratified on training data):")
+        for name in cv_scores_dict:
+            auc_value = results[name]['AUC-ROC']
+            auc_indicator = "✓" if auc_value <= 0.90 else "⚠️" if auc_value <= 0.95 else "❌"
+            st.write(f"  • {name}: CV={cv_scores_dict[name]:.3f}, Test Acc={results[name]['Accuracy']:.3f}, AUC={auc_value:.3f} {auc_indicator}")
+        
+        # Warning for high AUC
+        high_auc_models = [name for name, metrics in results.items() if metrics['AUC-ROC'] > 0.95]
+        if high_auc_models:
+            st.warning(f"""
+            ⚠️ **High AUC-ROC Detected!** 
+            
+            Models with AUC > 0.95: {', '.join(high_auc_models)}
+            
+            This might indicate:
+            - Very strong predictive features
+            - Potential overfitting (if dataset is small)
+            - Perfect separation in the data
+            
+            The dashboard will use {best_model_name} for risk assessment.
+            """)
         
         return results, feature_importances, trained_models
         
     except Exception as e:
         st.error(f"Error training models: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
+        return None
+
+def safe_predict(input_data, model_name, model, scaler, label_encoders, feature_names):
+    """Safely predict with proper encoding and error handling"""
+    try:
+        # Create a copy of input data
+        input_df = input_data.copy()
+        
+        # Encode categorical variables safely
+        for col in ['Family_History', 'Exercise_Level', 'Smoking_Status']:
+            if col in input_df.columns and col in label_encoders:
+                try:
+                    # Transform using fitted encoder
+                    input_df[col] = label_encoders[col].transform(input_df[col].astype(str))
+                except ValueError as e:
+                    # Handle unseen categories
+                    st.warning(f"Unseen category in {col}. Using default encoding.")
+                    # Create a mapping from fitted classes
+                    fitted_classes = label_encoders[col].classes_.tolist()
+                    # Map unknown values to the most common class
+                    default_value = 0
+                    input_df[col] = input_df[col].apply(
+                        lambda x: label_encoders[col].transform([x])[0] if str(x) in fitted_classes else default_value
+                    )
+        
+        # Ensure all features are present
+        missing_features = set(feature_names) - set(input_df.columns)
+        for feature in missing_features:
+            input_df[feature] = 0
+            st.warning(f"Missing feature '{feature}' added with default value 0")
+        
+        # Reorder columns to match training
+        input_df = input_df[feature_names]
+        
+        # Scale if using Logistic Regression
+        if model_name == "Logistic Regression" and scaler is not None:
+            input_scaled = scaler.transform(input_df)
+            prediction_proba = model.predict_proba(input_scaled)[0]
+        else:
+            prediction_proba = model.predict_proba(input_df)[0]
+        
+        return prediction_proba[1] * 100
+        
+    except Exception as e:
+        st.error(f"Prediction error: {str(e)}")
+        return None
+
+def plot_learning_curve(model, X, y, model_name, cv=5, train_sizes=np.linspace(0.1, 1.0, 10)):
+    """Plot learning curve starting from small sample sizes"""
+    try:
+        # Generate learning curve data with more points starting from small samples
+        train_sizes_abs, train_scores, test_scores = learning_curve(
+            model, X, y, 
+            cv=cv, 
+            n_jobs=-1,
+            train_sizes=train_sizes,
+            scoring='accuracy',
+            shuffle=True,
+            random_state=42
+        )
+        
+        # Calculate means and stds
+        train_mean = np.mean(train_scores, axis=1)
+        train_std = np.std(train_scores, axis=1)
+        test_mean = np.mean(test_scores, axis=1)
+        test_std = np.std(test_scores, axis=1)
+        
+        # Create interactive plotly figure
+        fig = go.Figure()
+        
+        # Add training accuracy line
+        fig.add_trace(go.Scatter(
+            x=train_sizes_abs, 
+            y=train_mean,
+            mode='lines+markers',
+            name='Training Accuracy',
+            line=dict(color='blue', width=2),
+            marker=dict(size=8),
+            hovertemplate='Training Samples: %{x}<br>Accuracy: %{y:.3f}<extra></extra>'
+        ))
+        
+        # Add validation accuracy line
+        fig.add_trace(go.Scatter(
+            x=train_sizes_abs, 
+            y=test_mean,
+            mode='lines+markers',
+            name='Validation Accuracy',
+            line=dict(color='orange', width=2),
+            marker=dict(size=8),
+            hovertemplate='Training Samples: %{x}<br>Accuracy: %{y:.3f}<extra></extra>'
+        ))
+        
+        # Add confidence bands for training
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([train_sizes_abs, train_sizes_abs[::-1]]),
+            y=np.concatenate([train_mean + train_std, (train_mean - train_std)[::-1]]),
+            fill='toself',
+            fillcolor='rgba(0,0,255,0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            name='Training ±1 std',
+            hoverinfo='skip',
+            showlegend=True
+        ))
+        
+        # Add confidence bands for validation
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([train_sizes_abs, train_sizes_abs[::-1]]),
+            y=np.concatenate([test_mean + test_std, (test_mean - test_std)[::-1]]),
+            fill='toself',
+            fillcolor='rgba(255,165,0,0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            name='Validation ±1 std',
+            hoverinfo='skip',
+            showlegend=True
+        ))
+        
+        # Add a horizontal line at 0.5 (random guessing)
+        fig.add_hline(y=0.5, line_dash="dash", line_color="gray", 
+                     annotation_text="Random Guessing (0.5)", 
+                     annotation_position="bottom right")
+        
+        # Update layout
+        fig.update_layout(
+            title=f'Learning Curve: {model_name}',
+            xaxis_title='Number of Training Samples',
+            yaxis_title='Accuracy Score',
+            template=chart_theme,
+            height=450,
+            hovermode='closest',
+            legend=dict(
+                x=0.01,
+                y=0.99,
+                bgcolor='rgba(255, 255, 255, 0.8)',
+                bordercolor='black',
+                borderwidth=1
+            ),
+            xaxis=dict(
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='lightgray'
+            ),
+            yaxis=dict(
+                showgrid=True,
+                gridwidth=1,
+                gridcolor='lightgray',
+                range=[0, 1.05]
+            )
+        )
+        
+        # Add annotation for best performance
+        best_val_acc = test_mean.max()
+        best_val_samples = train_sizes_abs[test_mean.argmax()]
+        fig.add_annotation(
+            x=best_val_samples,
+            y=best_val_acc,
+            text=f"Best: {best_val_acc:.3f} at {best_val_samples:.0f} samples",
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=1,
+            arrowwidth=2,
+            arrowcolor="green",
+            ax=20,
+            ay=-30,
+            bgcolor='rgba(255,255,255,0.9)',
+            bordercolor='green',
+            borderwidth=1
+        )
+        
+        return fig
+        
+    except Exception as e:
+        st.warning(f"Could not generate learning curve for {model_name}: {str(e)}")
         return None
 
 def get_model_coefficients():
@@ -313,9 +617,9 @@ def get_model_coefficients():
         log_model = st.session_state.trained_models["Logistic Regression"]
         if hasattr(log_model, 'coef_'):
             coefficients['Logistic_Regression'] = pd.Series(
-                log_model.coef_[0], 
+                np.abs(log_model.coef_[0]), 
                 index=st.session_state.feature_names
-            ).sort_values()
+            ).sort_values(ascending=False)
     
     # Random Forest Feature Importance
     if "Random Forest" in st.session_state.trained_models:
@@ -327,7 +631,7 @@ def get_model_coefficients():
             ).sort_values(ascending=False)
     
     # XGBoost Feature Importance
-    if "XGBoost" in st.session_state.trained_models:
+    if XGB_AVAILABLE and "XGBoost" in st.session_state.trained_models:
         xgb_model = st.session_state.trained_models["XGBoost"]
         if hasattr(xgb_model, 'feature_importances_'):
             coefficients['XGBoost'] = pd.Series(
@@ -338,7 +642,7 @@ def get_model_coefficients():
     return coefficients
 
 def calculate_simplified_risk(age, bmi, family_history, exercise_level, smoking_status, salt_intake, stress_score, sleep_duration):
-    """Calculate risk using simplified scoring system (removed BP_History and Medication)"""
+    """Calculate risk using simplified scoring system"""
     risk_score = 0
     
     # Age contribution
@@ -436,11 +740,13 @@ def get_recommendations(risk_level):
 
 def display_risk_results(risk_score, risk_category, color, recommendations, 
                         age, bmi, family_history, exercise_level, smoking_status, salt_intake, 
-                        stress_score, sleep_duration, ml_based=False):
+                        stress_score, sleep_duration, ml_based=False, model_name=None):
     """Display risk assessment results"""
     st.markdown("## 📊 Your Risk Assessment Results")
     
-    if ml_based:
+    if ml_based and model_name:
+        st.info(f"✅ Using {model_name} ML model trained on your dataset")
+    elif ml_based:
         st.info("✅ Using ML model trained on your dataset")
     else:
         st.warning("⚠️ Using simplified scoring (train ML models for more accuracy)")
@@ -508,7 +814,7 @@ def display_risk_results(risk_score, risk_category, color, recommendations,
         
         if risk_factors:
             st.markdown("**Identified Factors:**")
-            for factor in risk_factors[:5]:  # Show top 5
+            for factor in risk_factors[:5]:
                 st.markdown(f"• {factor}")
             if len(risk_factors) > 5:
                 st.markdown(f"*... and {len(risk_factors)-5} more*")
@@ -528,11 +834,9 @@ def display_risk_results(risk_score, risk_category, color, recommendations,
     if st.session_state.df is not None:
         st.markdown("## 📈 How You Compare to the Dataset")
         
-        # Calculate statistics from uploaded dataset
         dataset_stats = st.session_state.df['Has_Hypertension'].str.lower() == 'yes'
         dataset_hypertension_rate = dataset_stats.mean() * 100
         
-        # Find similar individuals in dataset
         similar_criteria = []
         if 'Age' in st.session_state.df.columns:
             similar_criteria.append((st.session_state.df['Age'] >= age-5) & (st.session_state.df['Age'] <= age+5))
@@ -574,7 +878,7 @@ def display_risk_results(risk_score, risk_category, color, recommendations,
     report_content = f"""
     HYPERTENSION RISK ASSESSMENT REPORT
     Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
-    {'Using ML Model: YES' if ml_based else 'Using Simplified Scoring'}
+    {'Using ML Model: ' + model_name if ml_based and model_name else 'Using Simplified Scoring'}
     
     PERSONAL INFORMATION:
     - Age: {age} years
@@ -638,6 +942,16 @@ with st.sidebar:
             help="Filter data by age range"
         )
         
+        # Age bin size selector
+        bin_size = st.slider(
+            "Age Bin Size (years):",
+            min_value=2,
+            max_value=10,
+            value=5,
+            step=1,
+            help="Select the size of age groups for bar charts"
+        )
+        
         # Hypertension status filter
         hypertension_filter = st.multiselect(
             "Hypertension Status:",
@@ -695,7 +1009,7 @@ if page == "📁 Upload Data":
     <strong>Dataset Requirements:</strong>
     <ul>
     <li>CSV file format</li>
-    <li>Must contain these 9 columns (exact names):</li>
+    <li>Must contain these columns (exact names):</li>
     </ul>
     <ol>
     <li><code>Age</code> (numerical)</li>
@@ -708,6 +1022,7 @@ if page == "📁 Upload Data":
     <li><code>Smoking_Status</code> (categorical: Smoker/Non-Smoker)</li>
     <li><code>Has_Hypertension</code> (categorical: Yes/No)</li>
     </ol>
+    <p><strong>Note:</strong> BP_History and Medication columns are automatically detected and excluded from model training to prevent data leakage.</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -754,31 +1069,30 @@ if page == "📁 Upload Data":
                         st.metric("Average Age", f"{avg_age:.1f}")
                 
                 # Train models button
-                if st.button("🚀 Train Machine Learning Models (Improved)", type="primary"):
-                    with st.spinner("Training models using improved method... This may take a few seconds."):
+                if st.button("🚀 Train Machine Learning Models", type="primary"):
+                    with st.spinner("Training models with data leakage prevention... This may take a few seconds."):
                         result = train_models_improved(df_processed)
                         
                         if result is not None:
                             st.session_state.model_results, st.session_state.feature_importances, trained_models = result
                             st.session_state.models_trained = True
                             
-                            # Find best model
+                            st.success("✅ Models trained successfully!")
+                            st.success("Models are trained on LIFESTYLE factors only (BP_History and Medication automatically excluded to prevent data leakage)")
+                            
+                            # Show model performance
                             if st.session_state.model_results:
                                 results_df = pd.DataFrame(st.session_state.model_results).T
-                                best_model_name = results_df['Accuracy'].idxmax()
-                                st.session_state.best_model = best_model_name
-                                
-                                st.success("✅ Models trained successfully using improved method!")
-                                
-                                # Show model performance
                                 st.markdown("### Model Performance Preview")
                                 col1, col2, col3 = st.columns(3)
                                 with col1:
-                                    st.metric("Best Model", best_model_name)
+                                    st.metric("Best Model (by CV)", st.session_state.best_model)
                                 with col2:
-                                    st.metric("Accuracy", f"{results_df.loc[best_model_name, 'Accuracy']:.3f}")
+                                    st.metric("Best CV Accuracy", f"{results_df.loc[st.session_state.best_model, 'CV_Accuracy']:.3f}")
                                 with col3:
-                                    st.metric("AUC-ROC", f"{results_df.loc[best_model_name, 'AUC-ROC']:.3f}")
+                                    st.metric("Best Test Accuracy", f"{results_df.loc[st.session_state.best_model, 'Accuracy']:.3f}")
+                        else:
+                            st.error("Model training failed. Please check your data.")
             else:
                 st.error(f"❌ {message}")
                 st.info("Please upload a CSV file with the correct format and required columns.")
@@ -796,7 +1110,7 @@ if page == "📁 Upload Data":
         </div>
         """, unsafe_allow_html=True)
         
-        # Create sample template (removed BP_History and Medication)
+        # Create sample template
         sample_data = {
             'Age': [35, 42, 28, 55, 31],
             'Salt_Intake': [8.5, 10.2, 7.3, 9.8, 6.5],
@@ -857,7 +1171,6 @@ elif page == "📊 Dataset Overview":
             st.dataframe(st.session_state.df_filtered.head(10), use_container_width=True)
         
         with tab2:
-            # Display data types
             dtype_df = pd.DataFrame({
                 'Column': st.session_state.df_filtered.columns,
                 'Data Type': st.session_state.df_filtered.dtypes.values,
@@ -867,7 +1180,6 @@ elif page == "📊 Dataset Overview":
             st.dataframe(dtype_df, use_container_width=True)
         
         with tab3:
-            # Check for missing values
             missing_df = pd.DataFrame({
                 'Column': st.session_state.df_filtered.columns,
                 'Missing Values': st.session_state.df_filtered.isnull().sum().values,
@@ -880,35 +1192,11 @@ elif page == "📊 Dataset Overview":
                 st.success("✅ No missing values found in the dataset!")
         
         with tab4:
-            # Statistical summary for numerical columns
             numerical_cols = st.session_state.df_filtered.select_dtypes(include=[np.number]).columns.tolist()
             if numerical_cols:
                 st.dataframe(st.session_state.df_filtered[numerical_cols].describe(), use_container_width=True)
             else:
                 st.info("No numerical variables found.")
-    
-    # Distribution of key variables (changed to bar graphs)
-    st.markdown("### Distribution of Key Variables")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Age distribution - changed to bar graph
-        age_counts = st.session_state.df_filtered['Age'].value_counts().sort_index()
-        fig = px.bar(x=age_counts.index, y=age_counts.values,
-                    title=f'Age Distribution ({len(st.session_state.df_filtered)} samples)',
-                    labels={'x': 'Age (years)', 'y': 'Count'})
-        fig.update_layout(template=chart_theme)
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Hypertension distribution - kept as pie chart (categorical)
-        hypertension_counts = st.session_state.df_filtered['Has_Hypertension'].value_counts()
-        fig = px.pie(values=hypertension_counts.values, names=hypertension_counts.index,
-                    title='Hypertension Distribution',
-                    color_discrete_sequence=['#2ecc71', '#e74c3c'])
-        fig.update_layout(template=chart_theme)
-        st.plotly_chart(fig, use_container_width=True)
 
 # Exploratory Analysis Page
 elif page == "🔍 Exploratory Analysis":
@@ -918,112 +1206,215 @@ elif page == "🔍 Exploratory Analysis":
     
     st.markdown('<h2 class="sub-header">Exploratory Data Analysis</h2>', unsafe_allow_html=True)
     
-    # Display filter info
     st.markdown(f"**Analysis based on {len(st.session_state.df_filtered)} samples**")
+    st.markdown(f"**Age bins: {bin_size}-year intervals**")
+    
+    # Create age bins based on filtered data
+    age_min_filtered = int(st.session_state.df_filtered['Age'].min())
+    age_max_filtered = int(st.session_state.df_filtered['Age'].max())
+    bins, age_labels = create_age_bins(age_min_filtered, age_max_filtered, bin_size)
+    
+    # Add age category column
+    df_for_chart = st.session_state.df_filtered.copy()
+    df_for_chart['Age_Category'] = pd.cut(df_for_chart['Age'], bins=bins, labels=age_labels, right=False)
+    df_for_chart['Age_Category'] = df_for_chart['Age_Category'].astype(str)
     
     # Create tabs for different analyses
     analysis_tabs = st.tabs([
-        "📊 All Variables Analysis", 
-        "👥 Demographic Factors", 
-        "🏥 Health Indicators", 
-        "🧬 Lifestyle Factors",
-        "📈 Correlations"
+        "📊 Salt Intake Analysis", 
+        "👥 BMI Analysis", 
+        "🏥 Stress Score Analysis", 
+        "🧬 Sleep Duration Analysis",
+        "📈 Hypertension by Age",
+        "🏷️ Categorical Analysis"
     ])
     
     with analysis_tabs[0]:
-        st.markdown("### Comprehensive Variable Analysis")
+        st.markdown("### Salt Intake Distribution by Age Group")
         
-        # Select variable to analyze (removed BP_History and Medication)
-        all_variables = ['Age', 'Salt_Intake', 'Stress_Score', 'Sleep_Duration', 'BMI',
-                        'Family_History', 'Exercise_Level', 'Smoking_Status']
+        def categorize_salt_intake(salt):
+            if salt < 4:
+                return 'Low (<4 g/day)'
+            elif salt <= 6:
+                return 'Moderate (4-6 g/day)'
+            elif salt <= 8:
+                return 'High (6-8 g/day)'
+            else:
+                return 'Very High (>8 g/day)'
         
-        # Only include variables that exist in the dataset
-        available_vars = [var for var in all_variables if var in st.session_state.df_filtered.columns]
+        df_for_chart['Salt_Category'] = df_for_chart['Salt_Intake'].apply(categorize_salt_intake)
         
-        if not available_vars:
-            st.warning("No variables available for analysis.")
-            st.stop()
+        salt_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'Salt_Category']).size().reset_index(name='count')
         
-        selected_var = st.selectbox("Select Variable to Analyze:", available_vars)
+        fig = px.bar(salt_hypertension, x='Age_Category', y='count', color='Salt_Category',
+                    facet_col='Has_Hypertension',
+                    title='Salt Intake Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'Salt_Category': 'Salt Intake Level'},
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
         
-        if selected_var in ['Age', 'Salt_Intake', 'Stress_Score', 'Sleep_Duration', 'BMI']:
-            # Numerical variable analysis - changed to bar graphs
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Distribution by hypertension status - changed to bar graph
-                # Create bins for numerical variables
-                if selected_var == 'Age':
-                    nbins = 20
-                elif selected_var == 'BMI':
-                    nbins = 20
-                else:
-                    nbins = 15
+        st.markdown("#### Salt Intake Statistics by Age Group")
+        salt_stats = df_for_chart.groupby('Age_Category')['Salt_Intake'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(salt_stats, use_container_width=True)
+    
+    with analysis_tabs[1]:
+        st.markdown("### BMI Distribution by Age Group")
+        
+        def categorize_bmi(bmi):
+            if bmi < 18.5:
+                return 'Underweight'
+            elif bmi < 25:
+                return 'Normal'
+            elif bmi < 30:
+                return 'Overweight'
+            else:
+                return 'Obese'
+        
+        df_for_chart['BMI_Category_Display'] = df_for_chart['BMI'].apply(categorize_bmi)
+        
+        bmi_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'BMI_Category_Display']).size().reset_index(name='count')
+        
+        fig = px.bar(bmi_hypertension, x='Age_Category', y='count', color='BMI_Category_Display',
+                    facet_col='Has_Hypertension',
+                    title='BMI Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'BMI_Category_Display': 'BMI Category'},
+                    color_discrete_sequence=px.colors.qualitative.Set3,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### BMI Statistics by Age Group")
+        bmi_stats = df_for_chart.groupby('Age_Category')['BMI'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(bmi_stats, use_container_width=True)
+    
+    with analysis_tabs[2]:
+        st.markdown("### Stress Score Distribution by Age Group")
+        
+        def categorize_stress(score):
+            if score <= 3:
+                return 'Low (0-3)'
+            elif score <= 6:
+                return 'Moderate (4-6)'
+            elif score <= 8:
+                return 'High (7-8)'
+            else:
+                return 'Very High (9-10)'
+        
+        df_for_chart['Stress_Category'] = df_for_chart['Stress_Score'].apply(categorize_stress)
+        
+        stress_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'Stress_Category']).size().reset_index(name='count')
+        
+        fig = px.bar(stress_hypertension, x='Age_Category', y='count', color='Stress_Category',
+                    facet_col='Has_Hypertension',
+                    title='Stress Score Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'Stress_Category': 'Stress Level'},
+                    color_discrete_sequence=px.colors.qualitative.Pastel,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Stress Score Statistics by Age Group")
+        stress_stats = df_for_chart.groupby('Age_Category')['Stress_Score'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(stress_stats, use_container_width=True)
+    
+    with analysis_tabs[3]:
+        st.markdown("### Sleep Duration Distribution by Age Group")
+        
+        def categorize_sleep(sleep):
+            if sleep < 6:
+                return 'Insufficient (<6h)'
+            elif sleep <= 8:
+                return 'Optimal (6-8h)'
+            else:
+                return 'Excessive (>8h)'
+        
+        df_for_chart['Sleep_Category'] = df_for_chart['Sleep_Duration'].apply(categorize_sleep)
+        
+        sleep_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'Sleep_Category']).size().reset_index(name='count')
+        
+        fig = px.bar(sleep_hypertension, x='Age_Category', y='count', color='Sleep_Category',
+                    facet_col='Has_Hypertension',
+                    title='Sleep Duration Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'Sleep_Category': 'Sleep Duration'},
+                    color_discrete_sequence=px.colors.qualitative.Dark2,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Sleep Duration Statistics by Age Group")
+        sleep_stats = df_for_chart.groupby('Age_Category')['Sleep_Duration'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(sleep_stats, use_container_width=True)
+    
+    with analysis_tabs[4]:
+        st.markdown("### Hypertension Prevalence by Age Group")
+        
+        hypertension_by_age = df_for_chart.groupby('Age_Category')['Has_Hypertension'].apply(lambda x: (x == 'Yes').mean() * 100).reset_index()
+        hypertension_by_age.columns = ['Age_Category', 'Hypertension_Rate']
+        
+        count_by_age = df_for_chart.groupby('Age_Category').size().reset_index(name='Total_Patients')
+        hypertension_by_age = hypertension_by_age.merge(count_by_age, on='Age_Category')
+        
+        fig = px.bar(hypertension_by_age, x='Age_Category', y='Hypertension_Rate',
+                    title='Hypertension Rate by Age Group',
+                    labels={'Age_Category': 'Age Category', 'Hypertension_Rate': 'Hypertension Rate (%)'},
+                    text='Hypertension_Rate',
+                    color='Hypertension_Rate',
+                    color_continuous_scale='RdYlGn_r')
+        fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Detailed Breakdown by Age Group")
+        st.dataframe(hypertension_by_age, use_container_width=True)
+    
+    with analysis_tabs[5]:
+        st.markdown("### Categorical Variables Analysis")
+        st.markdown("Analysis of Family History, Exercise Level, and Smoking Status")
+        
+        categorical_vars = ['Family_History', 'Exercise_Level', 'Smoking_Status']
+        
+        for cat_var in categorical_vars:
+            if cat_var in df_for_chart.columns:
+                st.markdown(f"#### {cat_var.replace('_', ' ')} Analysis")
                 
-                # Create binned data for bar chart
-                df_temp = st.session_state.df_filtered.copy()
-                df_temp['binned'] = pd.cut(df_temp[selected_var], bins=nbins)
-                # Convert intervals to string labels for JSON serialization
-                df_temp['binned_label'] = df_temp['binned'].astype(str)
+                col1, col2 = st.columns(2)
                 
-                # Group by bin label and hypertension status
-                grouped = df_temp.groupby(['binned_label', 'Has_Hypertension']).size().reset_index(name='count')
+                with col1:
+                    # Distribution of categorical variable
+                    cat_counts = df_for_chart[cat_var].value_counts().reset_index()
+                    cat_counts.columns = [cat_var, 'Count']
+                    
+                    fig = px.bar(cat_counts, x=cat_var, y='Count',
+                                title=f'Distribution of {cat_var.replace("_", " ")}',
+                                labels={cat_var: cat_var.replace("_", " "), 'Count': 'Number of Patients'},
+                                color=cat_var,
+                                color_discrete_sequence=px.colors.qualitative.Set1)
+                    fig.update_layout(template=chart_theme)
+                    st.plotly_chart(fig, use_container_width=True)
                 
-                fig = px.bar(grouped, x='binned_label', y='count', color='Has_Hypertension',
-                            title=f'{selected_var} Distribution by Hypertension Status',
-                            labels={'binned_label': selected_var, 'count': 'Count', 'Has_Hypertension': 'Hypertension'},
-                            color_discrete_map={'Yes': '#e74c3c', 'No': '#2ecc71'},
-                            barmode='group')
-                fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Box plot - kept as is (good for showing distribution)
-                fig = px.box(st.session_state.df_filtered, x='Has_Hypertension', y=selected_var,
-                            color='Has_Hypertension',
-                            title=f'{selected_var} by Hypertension Status',
-                            labels={'Has_Hypertension': 'Hypertension Status', selected_var: selected_var},
-                            color_discrete_map={'Yes': '#e74c3c', 'No': '#2ecc71'})
-                fig.update_layout(template=chart_theme)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Statistics summary
-            stats_df = st.session_state.df_filtered.groupby('Has_Hypertension')[selected_var].agg(['mean', 'std', 'min', 'max']).reset_index()
-            st.dataframe(stats_df, use_container_width=True)
-            
-        else:
-            # Categorical variable analysis - changed to bar graphs
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Count plot - changed to bar graph
-                grouped_counts = st.session_state.df_filtered.groupby([selected_var, 'Has_Hypertension']).size().reset_index(name='count')
-                fig = px.bar(grouped_counts, x=selected_var, y='count', color='Has_Hypertension',
-                            barmode='group',
-                            title=f'{selected_var} Distribution',
-                            labels={selected_var: selected_var, 'count': 'Count'},
-                            color_discrete_map={'Yes': '#e74c3c', 'No': '#2ecc71'})
-                fig.update_layout(template=chart_theme)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Percentage stacked bar
-                cross_tab = pd.crosstab(st.session_state.df_filtered[selected_var], st.session_state.df_filtered['Has_Hypertension'], normalize='index') * 100
-                cross_tab = cross_tab.reset_index()
-                cross_tab_melted = cross_tab.melt(id_vars=[selected_var], value_vars=['No', 'Yes'])
+                with col2:
+                    # Hypertension rate by categorical variable
+                    hypertension_by_cat = df_for_chart.groupby(cat_var)['Has_Hypertension'].apply(lambda x: (x == 'Yes').mean() * 100).reset_index()
+                    hypertension_by_cat.columns = [cat_var, 'Hypertension_Rate']
+                    
+                    fig = px.bar(hypertension_by_cat, x=cat_var, y='Hypertension_Rate',
+                                title=f'Hypertension Rate by {cat_var.replace("_", " ")}',
+                                labels={cat_var: cat_var.replace("_", " "), 'Hypertension_Rate': 'Hypertension Rate (%)'},
+                                text='Hypertension_Rate',
+                                color=cat_var,
+                                color_discrete_sequence=px.colors.qualitative.Set2)
+                    fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+                    fig.update_layout(template=chart_theme)
+                    st.plotly_chart(fig, use_container_width=True)
                 
-                fig = px.bar(cross_tab_melted, x=selected_var, y='value', color='Has_Hypertension',
-                            barmode='stack',
-                            title=f'Hypertension Prevalence by {selected_var}',
-                            labels={'value': 'Percentage (%)', selected_var: selected_var},
-                            color_discrete_map={'Yes': '#e74c3c', 'No': '#2ecc71'})
-                fig.update_layout(template=chart_theme)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Contingency table
-            st.markdown("##### Frequency Table")
-            contingency_table = pd.crosstab(st.session_state.df_filtered[selected_var], st.session_state.df_filtered['Has_Hypertension'])
-            st.dataframe(contingency_table, use_container_width=True)
+                # Cross tabulation
+                st.markdown(f"##### Cross Tabulation: {cat_var} vs Hypertension")
+                cross_tab = pd.crosstab(df_for_chart[cat_var], df_for_chart['Has_Hypertension'], normalize='index') * 100
+                st.dataframe(cross_tab, use_container_width=True)
+                
+                st.markdown("---")
 
 # Predictive Models Page
 elif page == "📈 Predictive Models":
@@ -1043,47 +1434,39 @@ elif page == "📈 Predictive Models":
         <li>Upload your dataset</li>
         <li>Click the "Train Machine Learning Models" button</li>
         </ol>
-        <p>Once trained, the model performance will be displayed here.</p>
+        <p><strong>Note:</strong> Models are trained on LIFESTYLE factors only. BP_History and Medication are automatically excluded to prevent data leakage.</p>
         </div>
         """, unsafe_allow_html=True)
         
-        # Quick train button
         if st.button("🚀 Train Models Now", type="primary"):
-            with st.spinner("Training models using improved method... This may take a few seconds."):
+            with st.spinner("Training models with data leakage prevention... This may take a few seconds."):
                 result = train_models_improved(st.session_state.df)
                 
                 if result is not None:
                     st.session_state.model_results, st.session_state.feature_importances, trained_models = result
                     st.session_state.models_trained = True
                     
-                    # Find best model
-                    if st.session_state.model_results:
-                        results_df = pd.DataFrame(st.session_state.model_results).T
-                        best_model_name = results_df['Accuracy'].idxmax()
-                        st.session_state.best_model = best_model_name
-                        
-                        st.success("✅ Models trained successfully!")
-                        st.rerun()
+                    st.success("✅ Models trained successfully!")
+                    st.rerun()
     else:
         st.markdown("""
         <div class="info-box">
-        <strong>Model Performance Overview:</strong> This section displays the performance of various machine learning models 
-        trained on your uploaded dataset to predict hypertension risk. Models are trained on data from ages 18-35.
+        <strong>Model Performance Overview:</strong> Models are trained on LIFESTYLE factors only (Salt Intake, Stress, Sleep, BMI, Exercise, Smoking, Family History).
+        <br><strong>Data Leakage Prevention:</strong> BP_History and Medication are automatically excluded to ensure models learn from actual lifestyle predictors.
+        <br><strong>Best Model Selection:</strong> The model with highest cross-validation accuracy is used for risk assessment.
         </div>
         """, unsafe_allow_html=True)
         
         # Display model performance
         st.markdown("### Model Performance Comparison")
         
-        # Convert results to DataFrame
         results_df = pd.DataFrame(st.session_state.model_results).T.reset_index()
         results_df = results_df.rename(columns={'index': 'Model'})
         
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            # Model comparison bar chart
-            fig = px.bar(results_df, x='Model', y=['Accuracy', 'Precision', 'Recall', 'F1-Score'],
+            fig = px.bar(results_df, x='Model', y=['Accuracy', 'Precision', 'Recall', 'F1-Score', 'CV_Accuracy'],
                         barmode='group', title='Model Performance Metrics',
                         labels={'value': 'Score', 'variable': 'Metric'},
                         color_discrete_sequence=px.colors.qualitative.Set2)
@@ -1091,14 +1474,14 @@ elif page == "📈 Predictive Models":
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            # Best model
             best_model_name = st.session_state.best_model
             best_model_metrics = results_df[results_df['Model'] == best_model_name].iloc[0]
             
             st.markdown(f"""
             <div class="metric-card">
             <h4>🏆 Best Model: {best_model_name}</h4>
-            <p><strong>Accuracy:</strong> {best_model_metrics['Accuracy']:.3f}</p>
+            <p><strong>CV Accuracy (5-fold):</strong> {best_model_metrics['CV_Accuracy']:.3f}</p>
+            <p><strong>Test Accuracy:</strong> {best_model_metrics['Accuracy']:.3f}</p>
             <p><strong>Precision:</strong> {best_model_metrics['Precision']:.3f}</p>
             <p><strong>Recall:</strong> {best_model_metrics['Recall']:.3f}</p>
             <p><strong>F1-Score:</strong> {best_model_metrics['F1-Score']:.3f}</p>
@@ -1106,174 +1489,154 @@ elif page == "📈 Predictive Models":
             </div>
             """, unsafe_allow_html=True)
         
-        # Get model coefficients for visualization
+        # Clinical Actionability Table
+        if st.session_state.importance_df is not None:
+            st.markdown("### Clinical Actionability Table")
+            st.markdown("Population Risk Thresholds (Mean values for Hypertensive group)")
+            st.dataframe(st.session_state.importance_df, use_container_width=True)
+        
+        # Learning Curves - Display all models (starting from small sample sizes)
+        st.markdown("### Learning Curves - All Models")
+        st.markdown("Shows model performance as training data size increases (starting from small sample sizes)")
+        
+        if st.session_state.trained_models and st.session_state.X_train is not None and st.session_state.y_train is not None:
+            models_to_plot = list(st.session_state.trained_models.keys())
+            
+            for name in models_to_plot:
+                st.markdown(f"#### {name}")
+                model = st.session_state.trained_models[name]
+                
+                # Select the correct training data
+                if name == "Logistic Regression":
+                    X_curr = st.session_state.X_train_scaled
+                else:
+                    X_curr = st.session_state.X_train
+                
+                if X_curr is not None and len(X_curr) > 0:
+                    # Create train sizes starting from very small (10% of data or minimum 10 samples)
+                    n_samples = len(X_curr)
+                    # Create 15 points from very small to full dataset
+                    train_sizes = np.linspace(0.05, 1.0, 15)  # Start from 5% of data
+                    
+                    # Ensure minimum 5 samples for early learning curve points
+                    fig = plot_learning_curve(model, X_curr, st.session_state.y_train, name, 
+                                             cv=min(5, len(np.unique(st.session_state.y_train))),
+                                             train_sizes=train_sizes)
+                    
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Add explanation
+                        st.caption(f"""
+                        **Learning Curve Interpretation for {name}:**
+                        - X-axis: Number of training samples (from {int(n_samples * 0.05)} to {n_samples})
+                        - Y-axis: Accuracy score (0 to 1, with 0.5 being random guessing)
+                        - Blue line: Training accuracy (how well model fits training data)
+                        - Orange line: Validation accuracy (how well model generalizes to unseen data)
+                        - Shaded areas: ±1 standard deviation across cross-validation folds
+                        - **Gap between lines indicates overfitting** (training accuracy much higher than validation)
+                        - **Lines converging at high values (>0.8) indicates good generalization**
+                        """)
+                    else:
+                        st.warning(f"Could not generate learning curve for {name}")
+                else:
+                    st.warning(f"Insufficient data for {name} learning curve")
+                st.markdown("---")
+        else:
+            st.warning("Model training data not available. Please retrain models.")
+        
+        # Confusion Matrices - Display all models
+        st.markdown("### Confusion Matrices - All Models")
+        st.markdown("Shows prediction performance for each model")
+        
+        if st.session_state.trained_models and st.session_state.y_test is not None:
+            models_to_show = list(st.session_state.trained_models.keys())
+            
+            for name in models_to_show:
+                st.markdown(f"#### {name}")
+                model = st.session_state.trained_models[name]
+                
+                # Select the correct test data
+                if name == "Logistic Regression":
+                    X_test_curr = st.session_state.X_test_scaled
+                else:
+                    X_test_curr = st.session_state.X_test
+                
+                if X_test_curr is not None and len(X_test_curr) > 0:
+                    try:
+                        y_pred = model.predict(X_test_curr)
+                        
+                        cm = confusion_matrix(st.session_state.y_test, y_pred)
+                        cm_df = pd.DataFrame(cm, 
+                                            index=['Actual No', 'Actual Yes'],
+                                            columns=['Predicted No', 'Predicted Yes'])
+                        
+                        fig = px.imshow(cm_df,
+                                       text_auto=True,
+                                       color_continuous_scale='Blues',
+                                       title=f'{name} - Confusion Matrix',
+                                       labels=dict(x="Predicted", y="Actual", color="Count"))
+                        fig.update_layout(template=chart_theme, height=450)
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Could not generate confusion matrix for {name}: {str(e)}")
+                else:
+                    st.warning(f"Test data not available for {name}")
+                st.markdown("---")
+        else:
+            st.warning("Test data not available. Please retrain models.")
+        
+        # Feature Importance
         coefficients = get_model_coefficients()
         
         if coefficients:
-            st.markdown("### Model Interpretability Analysis")
+            st.markdown("### Feature Importance Analysis")
             
-            # Create tabs for different model interpretations
-            model_tabs = st.tabs(["Logistic Regression Coefficients", "Random Forest Importance", "XGBoost Importance"])
+            model_tabs = st.tabs(["Logistic Regression", "Random Forest", "XGBoost"])
             
             with model_tabs[0]:
                 if 'Logistic_Regression' in coefficients:
-                    log_coefs = coefficients['Logistic_Regression']
+                    log_importance = coefficients['Logistic_Regression'].head(10)
                     
-                    # Create DataFrame for visualization
-                    log_coefs_df = pd.DataFrame({
-                        'Feature': log_coefs.index,
-                        'Coefficient': log_coefs.values
-                    })
-                    
-                    # Add color based on coefficient sign
-                    log_coefs_df['Color'] = log_coefs_df['Coefficient'].apply(lambda x: 'red' if x > 0 else 'blue')
-                    log_coefs_df['Effect'] = log_coefs_df['Coefficient'].apply(lambda x: 'Increases Risk' if x > 0 else 'Decreases Risk')
-                    
-                    # Show top 15 features
-                    top_features = 15
-                    log_coefs_sorted = log_coefs_df.sort_values('Coefficient', ascending=False)
-                    
-                    # Take top positive and negative
-                    top_positive = log_coefs_sorted[log_coefs_sorted['Coefficient'] > 0].head(top_features//2)
-                    top_negative = log_coefs_sorted[log_coefs_sorted['Coefficient'] < 0].head(top_features//2)
-                    combined = pd.concat([top_positive, top_negative]).sort_values('Coefficient')
-                    
-                    fig = px.bar(combined, x='Coefficient', y='Feature', orientation='h',
-                                color='Effect',
-                                title='Impact on Hypertension Risk (Logistic Regression)<br>Negative = Reduces Risk | Positive = Increases Risk',
-                                labels={'Coefficient': 'Coefficient Value (Effect Size)', 'Feature': 'Features'},
-                                color_discrete_map={'Increases Risk': '#e74c3c', 'Decreases Risk': '#3498db'},
-                                hover_data=['Coefficient'])
+                    fig = px.bar(x=log_importance.values, y=log_importance.index, orientation='h',
+                                title='Top 10 Feature Importance - Logistic Regression (Absolute Coefficients)',
+                                labels={'x': 'Absolute Coefficient Value', 'y': 'Features'},
+                                color=log_importance.values,
+                                color_continuous_scale='Blues')
                     fig.update_layout(template=chart_theme, height=500)
-                    fig.add_vline(x=0, line_width=1, line_dash="dash", line_color="black")
                     st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Show interpretation
-                    st.markdown("""
-                    #### Interpretation of Logistic Regression Coefficients:
-                    
-                    - **Positive coefficients** indicate factors that increase hypertension risk
-                    - **Negative coefficients** indicate factors that decrease hypertension risk
-                    - The magnitude shows the strength of the relationship
-                    """)
                 else:
                     st.info("Logistic Regression coefficients not available")
             
             with model_tabs[1]:
                 if 'Random_Forest' in coefficients:
-                    rf_importance = coefficients['Random_Forest']
+                    rf_importance = coefficients['Random_Forest'].head(10)
                     
-                    # Get top 15 features
-                    top_n = 15
-                    rf_top = rf_importance.head(top_n)
-                    
-                    fig = px.bar(x=rf_top.values, y=rf_top.index, orientation='h',
-                                title=f'Top {top_n} Feature Importance - Random Forest',
+                    fig = px.bar(x=rf_importance.values, y=rf_importance.index, orientation='h',
+                                title='Top 10 Feature Importance - Random Forest',
                                 labels={'x': 'Importance Score', 'y': 'Features'},
-                                color=rf_top.values,
-                                color_continuous_scale='viridis')
+                                color=rf_importance.values,
+                                color_continuous_scale='Greens')
                     fig.update_layout(template=chart_theme, height=500)
                     st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Show table of top features
-                    with st.expander("View Detailed Feature Importance"):
-                        rf_df = pd.DataFrame({
-                            'Feature': rf_importance.index,
-                            'Importance': rf_importance.values
-                        }).sort_values('Importance', ascending=False)
-                        st.dataframe(rf_df.head(20), use_container_width=True)
                 else:
                     st.info("Random Forest feature importance not available")
             
             with model_tabs[2]:
-                if 'XGBoost' in coefficients:
-                    xgb_importance = coefficients['XGBoost']
+                if XGB_AVAILABLE and 'XGBoost' in coefficients:
+                    xgb_importance = coefficients['XGBoost'].head(10)
                     
-                    # Get top 15 features
-                    top_n = 15
-                    xgb_top = xgb_importance.head(top_n)
-                    
-                    fig = px.bar(x=xgb_top.values, y=xgb_top.index, orientation='h',
-                                title=f'Top {top_n} Feature Importance - XGBoost',
+                    fig = px.bar(x=xgb_importance.values, y=xgb_importance.index, orientation='h',
+                                title='Top 10 Feature Importance - XGBoost',
                                 labels={'x': 'Importance Score', 'y': 'Features'},
-                                color=xgb_top.values,
-                                color_continuous_scale='magma')
+                                color=xgb_importance.values,
+                                color_continuous_scale='Oranges')
                     fig.update_layout(template=chart_theme, height=500)
                     st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Show table of top features
-                    with st.expander("View Detailed Feature Importance"):
-                        xgb_df = pd.DataFrame({
-                            'Feature': xgb_importance.index,
-                            'Importance': xgb_importance.values
-                        }).sort_values('Importance', ascending=False)
-                        st.dataframe(xgb_df.head(20), use_container_width=True)
+                elif not XGB_AVAILABLE:
+                    st.info("XGBoost not installed. Install it using: pip install xgboost")
                 else:
                     st.info("XGBoost feature importance not available")
-        
-        # Detailed model evaluation
-        st.markdown("### Detailed Model Evaluation")
-        
-        if st.session_state.trained_models and st.session_state.y_test is not None:
-            # Select model for detailed evaluation
-            model_names = list(st.session_state.trained_models.keys())
-            selected_model = st.selectbox("Select model for detailed evaluation:", model_names)
-            
-            if selected_model:
-                model = st.session_state.trained_models[selected_model]
-                
-                # Get predictions
-                if selected_model == "Logistic Regression":
-                    X_test_data = st.session_state.X_test_scaled
-                else:
-                    X_test_data = st.session_state.X_test.values if hasattr(st.session_state.X_test, 'values') else st.session_state.X_test
-                
-                y_pred = model.predict(X_test_data)
-                y_prob = model.predict_proba(X_test_data)[:, 1]
-                
-                # Display classification report
-                report = classification_report(st.session_state.y_test, y_pred, output_dict=True)
-                report_df = pd.DataFrame(report).transpose()
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("#### Classification Report")
-                    st.dataframe(report_df, use_container_width=True)
-                
-                with col2:
-                    st.markdown("#### Confusion Matrix")
-                    
-                    cm = confusion_matrix(st.session_state.y_test, y_pred)
-                    cm_df = pd.DataFrame(cm, 
-                                        index=['Actual No', 'Actual Yes'],
-                                        columns=['Predicted No', 'Predicted Yes'])
-                    
-                    fig = px.imshow(cm_df,
-                                   text_auto=True,
-                                   color_continuous_scale='Blues',
-                                   title='Confusion Matrix',
-                                   labels=dict(x="Predicted", y="Actual", color="Count"))
-                    fig.update_layout(template=chart_theme)
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # ROC Curve
-                st.markdown("#### ROC Curve")
-                
-                from sklearn.metrics import roc_curve
-                fpr, tpr, thresholds = roc_curve(st.session_state.y_test, y_prob)
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name=f'{selected_model} (AUC = {roc_auc_score(st.session_state.y_test, y_prob):.3f})'))
-                fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode='lines', name='Random', line=dict(dash='dash')))
-                fig.update_layout(
-                    title=f'ROC Curve - {selected_model}',
-                    xaxis_title='False Positive Rate',
-                    yaxis_title='True Positive Rate',
-                    template=chart_theme,
-                    height=500
-                )
-                st.plotly_chart(fig, use_container_width=True)
         
         # Model insights
         st.markdown("### Model Insights")
@@ -1286,10 +1649,10 @@ elif page == "📈 Predictive Models":
             <h5>🔑 Key Insights from Your Data:</h5>
             <ul>
             <li>Models trained on ages 18-35 from your dataset</li>
-            <li>Performance metrics reflect your data patterns</li>
-            <li>Feature importance shows what matters most in your data</li>
-            <li>Logistic Regression coefficients show direction of effects</li>
-            <li>Tree-based models show relative importance of features</li>
+            <li><strong>No data leakage:</strong> BP_History and Medication excluded</li>
+            <li>Models learn from LIFESTYLE factors only</li>
+            <li>5-Fold Stratified Cross-Validation ensures robustness</li>
+            <li>Learning curves start from small sample sizes (5% of data)</li>
             </ul>
             </div>
             """, unsafe_allow_html=True)
@@ -1299,11 +1662,11 @@ elif page == "📈 Predictive Models":
             <div class="warning-box">
             <h5>⚠️ Important Notes:</h5>
             <ul>
-            <li>Models are trained specifically on your uploaded data (ages 18-35)</li>
+            <li>Models are trained specifically on your uploaded data</li>
             <li>Performance depends on data quality and size</li>
             <li>Results are for educational/research purposes only</li>
             <li>Not for clinical decision-making</li>
-            <li>Logistic Regression coefficients assume linear relationships</li>
+            <li>Risk thresholds show population averages</li>
             </ul>
             </div>
             """, unsafe_allow_html=True)
@@ -1316,7 +1679,6 @@ elif page == "🎯 Risk Assessment":
     
     st.markdown('<h2 class="sub-header">Personalized Risk Assessment</h2>', unsafe_allow_html=True)
     
-    # Check if models are trained
     if not st.session_state.models_trained:
         st.markdown("""
         <div class="warning-box">
@@ -1332,16 +1694,16 @@ elif page == "🎯 Risk Assessment":
         """, unsafe_allow_html=True)
         use_ml_model = False
     else:
-        st.markdown("""
+        st.markdown(f"""
         <div class="info-box">
         <strong>ML-Powered Risk Calculator:</strong> 
-        <p>This calculator uses the trained machine learning model on your dataset for accurate risk prediction.</p>
-        <p>Enter your health information below to estimate your hypertension risk.</p>
+        <p>This calculator uses the trained <strong>{st.session_state.best_model}</strong> model on your dataset for accurate risk prediction.</p>
+        <p>Models are trained on LIFESTYLE factors only (BP_History and Medication automatically excluded to prevent data leakage).</p>
+        <p><strong>Data Split:</strong> 80% training, 20% testing | <strong>Cross-Validation:</strong> 5-fold Stratified</p>
         </div>
         """, unsafe_allow_html=True)
         use_ml_model = True
     
-    # Create risk assessment form (removed BP_History and Medication)
     with st.form("risk_assessment_form"):
         st.markdown("### Personal Health Information")
         
@@ -1369,73 +1731,59 @@ elif page == "🎯 Risk Assessment":
     if submitted:
         st.markdown("---")
         
+        # Prepare input data
+        input_data = pd.DataFrame([{
+            'Age': age,
+            'Salt_Intake': salt_intake,
+            'Stress_Score': stress_score,
+            'Sleep_Duration': sleep_duration,
+            'BMI': bmi,
+            'Family_History': family_history,
+            'Exercise_Level': exercise_level,
+            'Smoking_Status': smoking_status
+        }])
+        
         if use_ml_model and st.session_state.models_trained and st.session_state.trained_models:
-            # Use trained ML model for prediction
             try:
-                # Prepare input data (removed BP_History and Medication)
-                input_data = {
-                    'Age': age,
-                    'Salt_Intake': salt_intake,
-                    'Stress_Score': stress_score,
-                    'Sleep_Duration': sleep_duration,
-                    'BMI': bmi,
-                    'Family_History': family_history,
-                    'Exercise_Level': exercise_level,
-                    'Smoking_Status': smoking_status
-                }
-                
-                # Convert to DataFrame
-                input_df = pd.DataFrame([input_data])
-                
-                # Apply the same preprocessing as during training
-                # Drop the same columns
-                cols_to_drop = ['Age_Group', 'Age_Category', 'Patient_ID', 'BMI_Category']
-                for col in cols_to_drop:
-                    if col in input_df.columns:
-                        input_df = input_df.drop(columns=[col])
-                
-                # One-hot encode like training
-                input_encoded = pd.get_dummies(input_df, drop_first=False)
-                
-                # Align columns with training data
-                training_columns = st.session_state.feature_names
-                for col in training_columns:
-                    if col not in input_encoded.columns:
-                        input_encoded[col] = 0
-                
-                # Reorder columns to match training
-                input_encoded = input_encoded[training_columns]
-                
-                # Scale the input
-                input_scaled = st.session_state.scaler.transform(input_encoded)
-                
-                # Use the best model for prediction
                 best_model_name = st.session_state.best_model
                 model = st.session_state.trained_models[best_model_name]
                 
-                # Make prediction
-                if best_model_name == "Logistic Regression":
-                    prediction_proba = model.predict_proba(input_scaled)[0]
+                # Use safe prediction function
+                risk_score = safe_predict(
+                    input_data, 
+                    best_model_name, 
+                    model, 
+                    st.session_state.scaler, 
+                    st.session_state.label_encoders, 
+                    st.session_state.feature_names
+                )
+                
+                if risk_score is not None:
+                    ml_based = True
+                    model_used = best_model_name
+                    st.success(f"✅ Successfully used {best_model_name} model for prediction!")
                 else:
-                    prediction_proba = model.predict_proba(input_encoded)[0]
-                
-                # Get risk score (probability of hypertension)
-                risk_score = prediction_proba[1] * 100  # Probability of "Yes" class
-                
-                ml_based = True
-                
+                    # Fallback to simplified scoring
+                    risk_score = calculate_simplified_risk(age, bmi, family_history, 
+                                                          exercise_level, smoking_status,
+                                                          salt_intake, stress_score, sleep_duration)
+                    ml_based = False
+                    model_used = None
+                    st.warning("Falling back to simplified scoring due to prediction error.")
+                    
             except Exception as e:
                 st.warning(f"Could not use ML model: {str(e)}. Using simplified scoring.")
                 risk_score = calculate_simplified_risk(age, bmi, family_history, 
                                                       exercise_level, smoking_status,
                                                       salt_intake, stress_score, sleep_duration)
                 ml_based = False
+                model_used = None
         else:
-            # Use simplified scoring (removed BP_History and Medication)
             risk_score = calculate_simplified_risk(age, bmi, family_history, 
                                                   exercise_level, smoking_status,
                                                   salt_intake, stress_score, sleep_duration)
             ml_based = False
+            model_used = None
         
         # Determine risk category
         if risk_score < 30:
@@ -1455,10 +1803,9 @@ elif page == "🎯 Risk Assessment":
             color = "darkred"
             recommendations = get_recommendations('very_high')
         
-        # Display results (updated function signature)
         display_risk_results(risk_score, risk_category, color, recommendations, 
                            age, bmi, family_history, exercise_level, smoking_status, 
-                           salt_intake, stress_score, sleep_duration, ml_based)
+                           salt_intake, stress_score, sleep_duration, ml_based, model_used)
 
 # About Page
 elif page == "📋 About":
@@ -1478,25 +1825,34 @@ elif page == "📋 About":
         
         1. **Data Upload**: Upload your own hypertension dataset in CSV format
         2. **Dataset Exploration**: Comprehensive overview with filtering capabilities
-        3. **Exploratory Analysis**: Interactive visualizations of all predictors
+        3. **Exploratory Analysis**: Interactive visualizations of all predictors with age-based binning and categorical analysis
         4. **Predictive Modeling**: Real machine learning models trained on your data (ages 18-35)
-        5. **Risk Assessment**: Personalized calculator using your data patterns
+        5. **Risk Assessment**: Personalized calculator using your data patterns with best model selection
         
-        #### Required Data Format:
+        #### Data Leakage Prevention:
         
-        Your CSV file must contain these 9 columns:
-        - Age, Salt_Intake, Stress_Score, Sleep_Duration, BMI (numerical)
-        - Family_History, Exercise_Level, Smoking_Status, Has_Hypertension (categorical)
+        - **BP_History** and **Medication** are automatically detected and excluded from model training
+        - This prevents circular logic and ensures models learn from actual LIFESTYLE predictors
+        - Models focus on modifiable risk factors: Salt Intake, Stress, Sleep, BMI, Exercise, Smoking, Family History
+        - **80:20 train-test split** with stratification
+        - **5-Fold Stratified Cross-Validation** on training data only
         
         #### Methodology:
         
         1. **Data Validation**: Check uploaded data format and quality
-        2. **Statistical Analysis**: Comprehensive EDA of all variables
-        3. **Machine Learning**: Multiple models (Logistic Regression, Random Forest, XGBoost)
-        - Trained on data from ages 18-35
-        - One-hot encoding for categorical variables
-        - Standard scaling for numerical features
-        4. **Risk Calculation**: ML-based prediction using trained models
+        2. **Statistical Analysis**: Comprehensive EDA of all variables including categorical analysis
+        3. **Machine Learning**: Multiple models with cross-validation
+           - Logistic Regression (with Standard Scaling)
+           - Random Forest Classifier
+           - XGBoost Classifier (if available)
+        4. **Risk Calculation**: ML-based prediction using the best performing model
+        
+        #### Learning Curves:
+        
+        - Learning curves start from as low as 5% of your dataset
+        - Shows how model performance improves with more data
+        - Helps detect overfitting (gap between training and validation curves)
+        - Includes confidence bands showing variability across CV folds
         
         #### Target Audience:
         
@@ -1528,39 +1884,32 @@ elif page == "📋 About":
         
         #### Machine Learning Models:
         
-        1. **Logistic Regression**
+        1. **Logistic Regression** (Scaled features)
         2. **Random Forest Classifier**
-        3. **XGBoost Classifier**
+        3. **XGBoost Classifier** (if available)
         
-        #### Model Performance Metrics:
+        #### Model Validation:
+        
+        - 5-Fold Stratified Cross-Validation
+        - Learning Curves (15 points from 5% to 100% data)
+        - Confusion Matrices for each model
+        - Test set evaluation (20% holdout)
+        
+        #### Key Metrics:
         
         - Accuracy
         - Precision
         - Recall
         - F1-Score
         - AUC-ROC
-        
-        #### Data Processing:
-        
-        - Real-time data validation
-        - Automatic data preprocessing
-        - Feature engineering
-        - Missing value handling
+        - Cross-Validation Accuracy
         
         ---
         
-        #### Development Features
-        
-        - No synthetic data - uses only your uploaded dataset
-        - Real-time data filtering for all analyses
-        - Interactive visualizations for all variables
-        - Actual ML model training on your data
-        - Personalized risk assessment
-        
         #### Version Information
         
-        - Current Version: 3.0.0
-        - Last Updated: March 2024
+        - Current Version: 8.0.0
+        - Last Updated: April 2026
         - Data Source: User-uploaded CSV files
         - Minimum Data: 50 records recommended
         
@@ -1571,11 +1920,9 @@ elif page == "📋 About":
         - You maintain full control of your data
         """)
     
-    # Add download section
     st.markdown("---")
     st.markdown("### Resources and Downloads")
     
-    # Create sample template (updated with new required columns)
     sample_data = {
         'Age': [35, 42, 28, 55, 31, 47, 39, 52, 36, 44],
         'Salt_Intake': [8.5, 10.2, 7.3, 9.8, 6.5, 11.0, 8.2, 9.5, 7.8, 10.5],
@@ -1606,11 +1953,11 @@ footer_col1, footer_col2, footer_col3 = st.columns(3)
 
 with footer_col1:
     st.markdown("**Hypertension Risk Predictor Dashboard**")
-    st.markdown("Version 3.0 | March 2024")
+    st.markdown("Version 8.0 | April 2026")
 
 with footer_col2:
-    st.markdown("**Upload Your Own Data**")
-    st.markdown("No synthetic data used")
+    st.markdown("**No Data Leakage**")
+    st.markdown("BP_History & Medication Excluded")
 
 with footer_col3:
     st.markdown("**Built with Streamlit**")

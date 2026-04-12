@@ -1059,7 +1059,6 @@ elif page == "📊 Dataset Overview":
 # remain exactly the same as in the previous version to preserve all functionality
 
 elif page == "🔍 Exploratory Analysis":
-    elif page == "🔍 Exploratory Analysis":
     if st.session_state.df_filtered is None:
         st.warning("No data available after filtering. Adjust your filters.")
         st.stop()

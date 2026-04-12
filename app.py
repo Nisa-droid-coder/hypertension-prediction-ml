@@ -1059,8 +1059,222 @@ elif page == "📊 Dataset Overview":
 # remain exactly the same as in the previous version to preserve all functionality
 
 elif page == "🔍 Exploratory Analysis":
-    # Keep the existing Exploratory Analysis code (too long to repeat, but it's the same as before)
-    st.info("Exploratory Analysis page - same as previous version")
+    elif page == "🔍 Exploratory Analysis":
+    if st.session_state.df_filtered is None:
+        st.warning("No data available after filtering. Adjust your filters.")
+        st.stop()
+    
+    st.markdown('<h2 class="sub-header">Exploratory Data Analysis</h2>', unsafe_allow_html=True)
+    
+    st.markdown(f"**Analysis based on {len(st.session_state.df_filtered)} samples**")
+    st.markdown(f"**Age bins: {bin_size}-year intervals**")
+    
+    # Create age bins based on filtered data
+    age_min_filtered = int(st.session_state.df_filtered['Age'].min())
+    age_max_filtered = int(st.session_state.df_filtered['Age'].max())
+    bins, age_labels = create_age_bins(age_min_filtered, age_max_filtered, bin_size)
+    
+    # Add age category column
+    df_for_chart = st.session_state.df_filtered.copy()
+    df_for_chart['Age_Category'] = pd.cut(df_for_chart['Age'], bins=bins, labels=age_labels, right=False)
+    df_for_chart['Age_Category'] = df_for_chart['Age_Category'].astype(str)
+    
+    # Create tabs for different analyses
+    analysis_tabs = st.tabs([
+        "📊 Salt Intake Analysis", 
+        "👥 BMI Analysis", 
+        "🏥 Stress Score Analysis", 
+        "🧬 Sleep Duration Analysis",
+        "📈 Hypertension by Age",
+        "🏷️ Categorical Analysis"
+    ])
+    
+    with analysis_tabs[0]:
+        st.markdown("### Salt Intake Distribution by Age Group")
+        
+        def categorize_salt_intake(salt):
+            if salt < 4:
+                return 'Low (<4 g/day)'
+            elif salt <= 6:
+                return 'Moderate (4-6 g/day)'
+            elif salt <= 8:
+                return 'High (6-8 g/day)'
+            else:
+                return 'Very High (>8 g/day)'
+        
+        df_for_chart['Salt_Category'] = df_for_chart['Salt_Intake'].apply(categorize_salt_intake)
+        
+        salt_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'Salt_Category']).size().reset_index(name='count')
+        
+        fig = px.bar(salt_hypertension, x='Age_Category', y='count', color='Salt_Category',
+                    facet_col='Has_Hypertension',
+                    title='Salt Intake Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'Salt_Category': 'Salt Intake Level'},
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Salt Intake Statistics by Age Group")
+        salt_stats = df_for_chart.groupby('Age_Category')['Salt_Intake'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(salt_stats, use_container_width=True)
+    
+    with analysis_tabs[1]:
+        st.markdown("### BMI Distribution by Age Group")
+        
+        def categorize_bmi(bmi):
+            if bmi < 18.5:
+                return 'Underweight'
+            elif bmi < 25:
+                return 'Normal'
+            elif bmi < 30:
+                return 'Overweight'
+            else:
+                return 'Obese'
+        
+        df_for_chart['BMI_Category_Display'] = df_for_chart['BMI'].apply(categorize_bmi)
+        
+        bmi_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'BMI_Category_Display']).size().reset_index(name='count')
+        
+        fig = px.bar(bmi_hypertension, x='Age_Category', y='count', color='BMI_Category_Display',
+                    facet_col='Has_Hypertension',
+                    title='BMI Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'BMI_Category_Display': 'BMI Category'},
+                    color_discrete_sequence=px.colors.qualitative.Set3,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### BMI Statistics by Age Group")
+        bmi_stats = df_for_chart.groupby('Age_Category')['BMI'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(bmi_stats, use_container_width=True)
+    
+    with analysis_tabs[2]:
+        st.markdown("### Stress Score Distribution by Age Group")
+        
+        def categorize_stress(score):
+            if score <= 3:
+                return 'Low (0-3)'
+            elif score <= 6:
+                return 'Moderate (4-6)'
+            elif score <= 8:
+                return 'High (7-8)'
+            else:
+                return 'Very High (9-10)'
+        
+        df_for_chart['Stress_Category'] = df_for_chart['Stress_Score'].apply(categorize_stress)
+        
+        stress_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'Stress_Category']).size().reset_index(name='count')
+        
+        fig = px.bar(stress_hypertension, x='Age_Category', y='count', color='Stress_Category',
+                    facet_col='Has_Hypertension',
+                    title='Stress Score Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'Stress_Category': 'Stress Level'},
+                    color_discrete_sequence=px.colors.qualitative.Pastel,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Stress Score Statistics by Age Group")
+        stress_stats = df_for_chart.groupby('Age_Category')['Stress_Score'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(stress_stats, use_container_width=True)
+    
+    with analysis_tabs[3]:
+        st.markdown("### Sleep Duration Distribution by Age Group")
+        
+        def categorize_sleep(sleep):
+            if sleep < 6:
+                return 'Insufficient (<6h)'
+            elif sleep <= 8:
+                return 'Optimal (6-8h)'
+            else:
+                return 'Excessive (>8h)'
+        
+        df_for_chart['Sleep_Category'] = df_for_chart['Sleep_Duration'].apply(categorize_sleep)
+        
+        sleep_hypertension = df_for_chart.groupby(['Age_Category', 'Has_Hypertension', 'Sleep_Category']).size().reset_index(name='count')
+        
+        fig = px.bar(sleep_hypertension, x='Age_Category', y='count', color='Sleep_Category',
+                    facet_col='Has_Hypertension',
+                    title='Sleep Duration Distribution by Age Group and Hypertension Status',
+                    labels={'Age_Category': 'Age Category', 'count': 'Number of Patients', 'Sleep_Category': 'Sleep Duration'},
+                    color_discrete_sequence=px.colors.qualitative.Dark2,
+                    barmode='group')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Sleep Duration Statistics by Age Group")
+        sleep_stats = df_for_chart.groupby('Age_Category')['Sleep_Duration'].agg(['mean', 'std', 'min', 'max']).reset_index()
+        st.dataframe(sleep_stats, use_container_width=True)
+    
+    with analysis_tabs[4]:
+        st.markdown("### Hypertension Prevalence by Age Group")
+        
+        hypertension_by_age = df_for_chart.groupby('Age_Category')['Has_Hypertension'].apply(lambda x: (x == 'Yes').mean() * 100).reset_index()
+        hypertension_by_age.columns = ['Age_Category', 'Hypertension_Rate']
+        
+        count_by_age = df_for_chart.groupby('Age_Category').size().reset_index(name='Total_Patients')
+        hypertension_by_age = hypertension_by_age.merge(count_by_age, on='Age_Category')
+        
+        fig = px.bar(hypertension_by_age, x='Age_Category', y='Hypertension_Rate',
+                    title='Hypertension Rate by Age Group',
+                    labels={'Age_Category': 'Age Category', 'Hypertension_Rate': 'Hypertension Rate (%)'},
+                    text='Hypertension_Rate',
+                    color='Hypertension_Rate',
+                    color_continuous_scale='RdYlGn_r')
+        fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig.update_layout(template=chart_theme, xaxis_tickangle=-45)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("#### Detailed Breakdown by Age Group")
+        st.dataframe(hypertension_by_age, use_container_width=True)
+    
+    with analysis_tabs[5]:
+        st.markdown("### Categorical Variables Analysis")
+        st.markdown("Analysis of Family History, Exercise Level, and Smoking Status")
+        
+        categorical_vars = ['Family_History', 'Exercise_Level', 'Smoking_Status']
+        
+        for cat_var in categorical_vars:
+            if cat_var in df_for_chart.columns:
+                st.markdown(f"#### {cat_var.replace('_', ' ')} Analysis")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Distribution of categorical variable
+                    cat_counts = df_for_chart[cat_var].value_counts().reset_index()
+                    cat_counts.columns = [cat_var, 'Count']
+                    
+                    fig = px.bar(cat_counts, x=cat_var, y='Count',
+                                title=f'Distribution of {cat_var.replace("_", " ")}',
+                                labels={cat_var: cat_var.replace("_", " "), 'Count': 'Number of Patients'},
+                                color=cat_var,
+                                color_discrete_sequence=px.colors.qualitative.Set1)
+                    fig.update_layout(template=chart_theme)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    # Hypertension rate by categorical variable
+                    hypertension_by_cat = df_for_chart.groupby(cat_var)['Has_Hypertension'].apply(lambda x: (x == 'Yes').mean() * 100).reset_index()
+                    hypertension_by_cat.columns = [cat_var, 'Hypertension_Rate']
+                    
+                    fig = px.bar(hypertension_by_cat, x=cat_var, y='Hypertension_Rate',
+                                title=f'Hypertension Rate by {cat_var.replace("_", " ")}',
+                                labels={cat_var: cat_var.replace("_", " "), 'Hypertension_Rate': 'Hypertension Rate (%)'},
+                                text='Hypertension_Rate',
+                                color=cat_var,
+                                color_discrete_sequence=px.colors.qualitative.Set2)
+                    fig.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+                    fig.update_layout(template=chart_theme)
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Cross tabulation
+                st.markdown(f"##### Cross Tabulation: {cat_var} vs Hypertension")
+                cross_tab = pd.crosstab(df_for_chart[cat_var], df_for_chart['Has_Hypertension'], normalize='index') * 100
+                st.dataframe(cross_tab, use_container_width=True)
+                
+                st.markdown("---")
     
 elif page == "📈 Predictive Models":
     # Keep the existing Predictive Models code but use the faster learning curve function
